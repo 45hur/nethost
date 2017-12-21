@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <windows.h>
 #include <metahost.h>
+#include <Shlobj.h>
 
 #pragma comment(lib, "mscoree.lib")
 
@@ -61,7 +62,7 @@ HRESULT RuntimeHostV4(PCWSTR pszVersion, PCWSTR pszAssemblyPath,
 		goto Cleanup;
 	}
 
-	wprintf(L"Load the assembly %s\n", pszAssemblyPath);
+	wprintf(L"Load the assembly %s\nargs\n%s\n", pszAssemblyPath, pszStringArg);
 	DWORD returnValue = 0;
 	hr = pClrRuntimeHost->ExecuteInDefaultAppDomain(pszAssemblyPath,
 		pszClassName, pszStaticMethodName, pszStringArg, &returnValue);
@@ -79,46 +80,154 @@ Cleanup:
 	if (pMetaHost)
 	{
 		pMetaHost->Release();
-		pMetaHost = NULL;
+		pMetaHost = nullptr;
 	}
 	if (pRuntimeInfo)
 	{
 		pRuntimeInfo->Release();
-		pRuntimeInfo = NULL;
+		pRuntimeInfo = nullptr;
 	}
 	if (pClrRuntimeHost)
 	{
-		//wprintf(L"Stop the .NET runtime\n");
-		//pClrRuntimeHost->Stop();
+		wprintf(L"Stop the .NET runtime\n");
+		pClrRuntimeHost->Stop();
 
 		pClrRuntimeHost->Release();
-		pClrRuntimeHost = NULL;
+		pClrRuntimeHost = nullptr;
 	}
 
 	return hr;
 }
 
-int wmain(int argc, const wchar_t *argv[])
+int GetPathFromRegistry(const wchar_t *wsKey, const wchar_t *wsValueName, wchar_t *wsPath)
 {
-	wchar_t* data = NULL;
-	int length = 0;
-	for (int i = 1; i < argc; i++)
+	HKEY hKey;
+	auto lRet = RegOpenKeyEx(HKEY_LOCAL_MACHINE, wsKey, 0L, KEY_READ, &hKey);
+
+	if (lRet != ERROR_SUCCESS)
+	{
+		return -1;
+	}
+
+	DWORD dwDataSize = MAX_PATH;
+	DWORD dwType;
+	lRet = RegQueryValueEx(hKey, wsValueName, nullptr, &dwType, reinterpret_cast<LPBYTE>(wsPath), &dwDataSize);
+
+	if (lRet != ERROR_SUCCESS)
+	{
+		return -1;
+	}
+
+	RegCloseKey(hKey);
+	return ERROR_SUCCESS;
+}
+
+int count_chars(const wchar_t *&argument)
+{
+	auto length = wcslen(argument);
+	auto count = 0;
+	for (auto i = 0; i < length; i++)
+	{
+		if (argument[i] == '"' /*|| argument[i] == '\\'*/)
+			count++;
+	}
+
+	return count;
+}
+
+wchar_t *escape_quotes(const wchar_t *&argument)
+{
+	auto length = wcslen(argument);
+	auto count = count_chars(argument);
+	
+	int size = sizeof(wchar_t) * (length + count + 1);
+	auto result = static_cast<wchar_t*>(malloc(size));
+	memset(result, 0, size);
+	for (auto i = 0, j = 0; i <= length; i++, j++) 
+	{
+		switch (argument[i])
+		{
+			case '"':
+				result[j] = '\\';
+				result[j + 1] = '"';
+				j++;
+				break;
+			//case '\\':
+			//	result[j] = '\\';
+			//	result[j + 1] = '\\';
+			//	j++;
+			default:
+				result[j] = argument[i];
+		}
+	}
+
+	return result;
+}
+
+wchar_t *encapsulate_args(int argc, const wchar_t *argv[])
+{
+	auto length = 0;
+	for (auto i = 1; i < argc; i++)
 	{
 		length += wcslen(argv[i]) + 3;
+		length += count_chars(argv[i]);
 	}
 
 	int size = sizeof(wchar_t) * (length + argc);
-	data = (wchar_t*)malloc(size);
+	auto data = static_cast<wchar_t*>(malloc(size));
 	memset(data, 0, size);
-	wchar_t *database = data;
-	for (int i = 1; i < argc; i++)
+	auto database = data;
+	for (auto i = 1; i < argc; i++)
 	{
-		length = wcslen(argv[i]);
-		wsprintf(data, L"\"%s\" ", argv[i]);
+		auto escaped = escape_quotes(argv[i]);
+		length = wcslen(escaped);
+		wsprintf(data, L"\"%s\" ", escaped);
 		data += length + 3;
 	}
 
-    RuntimeHostV4(L"v4.0.30319", L"ConsoleApp1.exe", L"ConsoleApp1.Program", L"Start", database);
+	return database;
+}
 
-    return 0;
+int wmain(int argc, const wchar_t *argv[])
+{
+	wchar_t wsRegPath[MAX_PATH];
+	wchar_t wsBlPath[MAX_PATH];
+	wchar_t commonFilesPath[MAX_PATH];
+	wchar_t openSslPath[MAX_PATH];
+
+	if (!SHGetSpecialFolderPath(nullptr, commonFilesPath, CSIDL_PROGRAM_FILES_COMMONX86, FALSE))
+	{
+		wprintf(L"Couldn't get common files directory.\n");
+		return -1;
+	}
+
+#ifdef _WIN64
+	auto lRet = GetPathFromRegistry(L"SOFTWARE\\WOW6432Node\\SolarWinds\\Orion\\Core", L"InstallPath", wsRegPath);
+	wsprintf(wsBlPath, L"%sSolarWinds.BusinessLayerHostx64.exe", wsRegPath);
+	wsprintf(openSslPath, L"%s\\SolarWinds\\OpenSSL\\x64\\", commonFilesPath);
+#else
+	auto lRet = GetPathFromRegistry(L"SOFTWARE\\SolarWinds\\Orion\\Core", L"InstallPath", wsRegPath);
+	wsprintf(wsBlPath, L"%sSolarWinds.BusinessLayerHost.exe", wsRegPath);
+	wsprintf(openSslPath, L"%s\\SolarWinds\\OpenSSL\\x86\\", commonFilesPath);
+#endif
+	if (lRet != ERROR_SUCCESS)
+	{
+		wprintf(L"Couldn't read InstallPath from Windows registry.\n");
+		return -1;
+	}
+
+	if (!SetDllDirectory(openSslPath))
+	{
+		wprintf(L"Couldn't set dll directory.\n");
+		return -1;
+	}
+
+	if (nullptr == LoadLibrary(L"libeay32.dll"))
+	{
+		wprintf(L"Couldn't load libeay32.dll.\n");
+		return -1;
+	}
+
+	auto encapsulated_args = encapsulate_args(argc, argv);
+    return RuntimeHostV4(L"v4.0.30319", wsBlPath, L"SolarWinds.BusinessLayerHost.Program", L"Start", encapsulated_args);
 }
